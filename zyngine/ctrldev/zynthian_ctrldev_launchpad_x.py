@@ -5,9 +5,10 @@
 #
 # Zynthian Control Device Driver for "Novation Launchpad X"
 #
-# Copyright (C) 2015-2023 Fernando Moyano <jofemodo@zynthian.org>
+# Copyright (C) 2015-2025 Fernando Moyano <jofemodo@zynthian.org>
 #                         Brian Walton <brian@riban.co.uk>
 #                         Wapata <wapata.31@gmail.com>
+#
 #
 # ******************************************************************************
 #
@@ -29,9 +30,9 @@ import logging
 from time import sleep
 
 # Zynthian specific modules
-from zyngine.ctrldev.zynthian_ctrldev_base import zynthian_ctrldev_zynpad
-from zyncoder.zyncore import lib_zyncore
 from zynlibs.zynseq import zynseq
+from zyncoder.zyncore import lib_zyncore
+from zyngine.ctrldev.zynthian_ctrldev_base import zynthian_ctrldev_zynpad
 
 # ------------------------------------------------------------------------------------------------------------------
 # Novation Launchpad X
@@ -46,11 +47,13 @@ class zynthian_ctrldev_launchpad_x(zynthian_ctrldev_zynpad):
                    13, 96, 2, 81, 82, 83, 84, 85, 86, 87]
     STARTING_COLOUR = 21
     STOPPING_COLOUR = 5
+    SELECTED_BANK_COLOUR = 29
+    STOP_ALL_COLOUR = 5
 
     def send_sysex(self, data):
         if self.idev_out is not None:
-            msg = bytes.fromhex("F0 00 20 29 02 0C {} F7".format(data))
-            lib_zyncore.dev_send_midi_event(self.idev, msg, len(msg))
+            msg = bytes.fromhex(f"F0 00 20 29 02 0C {data} F7")
+            lib_zyncore.dev_send_midi_event(self.idev_out, msg, len(msg))
             sleep(0.05)
 
     def get_note_xy(self, note):
@@ -61,43 +64,41 @@ class zynthian_ctrldev_launchpad_x(zynthian_ctrldev_zynpad):
     def init(self):
         # Awake
         self.sleep_off()
+        # self.send_sysex_universal_inquiry()
         # Enter DAW session mode
         self.send_sysex("10 01")
         # Select session layout (session = 0x00, faders = 0x0D)
         self.send_sysex("00 00")
-        # Light off
-        # self.light_off()
+        super().init()
 
     def end(self):
-        # Light off
-        self.light_off()
+        super().end()
         # Exit DAW session mode
         self.send_sysex("10 00")
         # Select Keys layout (drums = 0x04, keys = 0x05, user = 0x06, prog = 0x7F)
         self.send_sysex("00 05")
 
-    # Zynpad Scene LED feedback
-    def refresh_zynpad_bank(self):
+    def update_seq_bank(self):
         if self.idev_out is None:
             return
         # logging.debug("Updating Launchpad X bank leds")
-        for row in range(0, 8):
+        for row in range(0, 7):
             note = 89 - 10 * row
             if row == self.zynseq.bank - 1:
                 lib_zyncore.dev_send_ccontrol_change(
-                    self.idev_out, 0, note, 29)
+                    self.idev_out, 0, note, self.SELECTED_BANK_COLOUR)
             else:
                 lib_zyncore.dev_send_ccontrol_change(self.idev_out, 0, note, 0)
+        # Stop All button => Solid Red
+        lib_zyncore.dev_send_ccontrol_change(
+            self.idev_out, 0, 19, self.STOP_ALL_COLOUR)
 
-    # Zynpad Pad LED feedback
-    def update_pad(self, pad, state, mode):
-        if self.idev_out is None:
+    def update_seq_state(self, bank, seq, state, mode, group):
+        if self.idev_out is None or bank != self.zynseq.bank:
             return
-        # logging.debug("Updating Launchpad X pad {}".format(pad))
-        col, row = self.zynseq.get_xy_from_pad(pad)
+        # logging.debug(f"Updating Launchpad X bank {bank} pad {seq} => state {state}, mode {mode}")
+        col, row = self.zynseq.get_xy_from_pad(seq)
         note = 10 * (8 - row) + col + 1
-
-        group = self.zynseq.libseq.getGroup(self.zynseq.bank, pad)
         try:
             if mode == 0:
                 chan = 0
@@ -120,11 +121,16 @@ class zynthian_ctrldev_launchpad_x(zynthian_ctrldev_zynpad):
         except:
             chan = 0
             vel = 0
-        # logging.debug("Lighting PAD {}, group {} => {}, {}, {}".format(pad, group, chan, note, vel))
+        # logging.debug("Lighting PAD {}, group {} => {}, {}, {}".format(seq, group, chan, note, vel))
         lib_zyncore.dev_send_note_on(self.idev_out, chan, note, vel)
 
+    # Light-Off the pad specified with column & row
+    def pad_off(self, col, row):
+        note = 10 * (8 - row) + col + 1
+        lib_zyncore.dev_send_note_on(self.idev_out, 0, note, 0)
+
     def midi_event(self, ev):
-        # logging.debug("Launchpad X MIDI handler => {}".format(ev))
+        # logging.debug(f"Launchpad X MIDI handler => {ev}")
         evtype = (ev[0] >> 4) & 0x0F
         # Note ON => launch/stop sequence
         if evtype == 0x9:
@@ -136,23 +142,30 @@ class zynthian_ctrldev_launchpad_x(zynthian_ctrldev_zynpad):
                 if pad >= 0:
                     self.zynseq.libseq.togglePlayState(self.zynseq.bank, pad)
             return True
-        # CC => scene change
+        # CC => arrows, scene change, stop all
         elif evtype == 0xB:
             ccnum = ev[1] & 0x7F
             ccval = ev[2] & 0x7F
             if ccval > 0:
                 if ccnum == 0x5B:
-                    self.zyngui.cuia_arrow_up()
+                    self.state_manager.send_cuia("ARROW_UP")
                 elif ccnum == 0x5C:
-                    self.zyngui.cuia_arrow_down()
+                    self.state_manager.send_cuia("ARROW_DOWN")
                 elif ccnum == 0x5D:
-                    self.zyngui.cuia_arrow_left()
+                    self.state_manager.send_cuia("ARROW_LEFT")
                 elif ccnum == 0x5E:
-                    self.zyngui.cuia_arrow_right()
+                    self.state_manager.send_cuia("ARROW_RIGHT")
                 else:
                     col, row = self.get_note_xy(ccnum)
                     if col == 8:
-                        self.zynseq.set_bank(row + 1)
+                        if row < 7:
+                            self.zynseq.select_bank(row + 1)
+                        elif row == 7:
+                            self.zynseq.libseq.stop()
+            return True
+        # SysEx
+        elif ev[0] == 0xF0:
+            logging.info(f"Received SysEx => {ev.hex(' ')}")
             return True
 
     # Light-Off LEDs
